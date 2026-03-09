@@ -1,14 +1,14 @@
 # ============================================================
-#  locate.ps1  -  Fast recursive file/folder search
-#  Version: 1.0
+#  locate.ps1  -  Fast parallel file/folder search
+#  Version: 1.1
 #
 #  Usage:
-#    locate <n>                  - search across C:\
-#    locate <n> -Root D:\        - search from a different root
-#    locate <n> -First           - stop at first match
-#    locate <n> -CaseSensitive   - exact case matching
-#    locate <n> -FilesOnly       - only return files
-#    locate <n> -FoldersOnly     - only return folders
+#    locate <name>               - search across ALL drives
+#    locate <name> -Root D:\     - search from a specific root
+#    locate <name> -First        - stop at first match
+#    locate <name> -CaseSensitive
+#    locate <name> -FilesOnly
+#    locate <name> -FoldersOnly
 #    locate -update              - check GitHub for latest version
 #    locate -uninstall           - remove locate from this machine
 #    locate -remove-installer    - delete the installer script
@@ -16,7 +16,7 @@
 #  Examples:
 #    locate file.txt
 #    locate reports
-#    locate *.log -Root C:\Users
+#    locate *.log
 #    locate config -CaseSensitive
 #    locate report.pdf -Root D:\ -First
 # ============================================================
@@ -25,7 +25,7 @@ param(
     [Parameter(Position = 0)]
     [string]$Name,
 
-    [string]$Root = "C:\",
+    [string]$Root = "",              # Empty = search ALL drives
     [switch]$CaseSensitive,
     [switch]$FilesOnly,
     [switch]$FoldersOnly,
@@ -36,7 +36,7 @@ param(
 )
 
 # ── Constants ───────────────────────────────────────────────
-$currentVersion = "1.0"
+$currentVersion = "1.1"
 $installDir     = Join-Path $env:USERPROFILE "Tools"
 $scriptPath     = Join-Path $installDir "locate.ps1"
 $configPath     = Join-Path $installDir "locate.config"
@@ -98,7 +98,7 @@ if ($Uninstall) {
     Write-Host "       Use 'locate -remove-installer' for that separately." -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  ℹ️   If you keep a copy of locate.ps1 elsewhere," -ForegroundColor DarkGray
-    Write-Host "       you can still run it directly with .\locate.ps1 <n>" -ForegroundColor DarkGray
+    Write-Host "       you can still run it directly with .\locate.ps1 <name>" -ForegroundColor DarkGray
     Write-Host "       and re-install anytime." -ForegroundColor DarkGray
     Write-Host ""
     $answer = Read-Host "  ❓  Proceed with uninstall? (yes/no)"
@@ -109,7 +109,6 @@ if ($Uninstall) {
         exit 0
     }
 
-    # Remove function block from PowerShell profile
     $profilePath = $PROFILE.CurrentUserAllHosts
     if (Test-Path $profilePath) {
         $profileContent = Get-Content $profilePath -Raw
@@ -118,13 +117,11 @@ if ($Uninstall) {
         Write-Host "  ✅  Removed 'locate' function from PowerShell profile." -ForegroundColor Green
     }
 
-    # Remove Tools folder from user PATH
     $currentPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
     $newPath = ($currentPath -split ";" | Where-Object { $_.TrimEnd("\") -ne $installDir.TrimEnd("\") }) -join ";"
     [System.Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
     Write-Host "  ✅  Removed '$installDir' from PATH." -ForegroundColor Green
 
-    # Delete locate.ps1 and locate.config
     @($scriptPath, $configPath) | ForEach-Object {
         if (Test-Path $_) {
             Remove-Item $_ -Force
@@ -132,7 +129,6 @@ if ($Uninstall) {
         }
     }
 
-    # Clean up Tools folder if now empty
     if ((Test-Path $installDir) -and (-not (Get-ChildItem $installDir))) {
         Remove-Item $installDir -Force
         Write-Host "  ✅  Removed empty Tools folder." -ForegroundColor Green
@@ -181,14 +177,14 @@ if ($RemoveInstaller) {
 }
 
 # ============================================================
-#  Main search
+#  Help / no args
 # ============================================================
 if (-not $Name) {
     Write-Host ""
-    Write-Host "  Usage: locate <n> [options]" -ForegroundColor Yellow
+    Write-Host "  Usage: locate <name> [options]" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "  Options:"
-    Write-Host "    -Root <path>       Search from a specific folder or drive"
+    Write-Host "    -Root <path>       Search a specific folder or drive (default: all drives)"
     Write-Host "    -First             Stop at first match"
     Write-Host "    -CaseSensitive     Match exact case"
     Write-Host "    -FilesOnly         Return files only"
@@ -200,37 +196,48 @@ if (-not $Name) {
     exit 0
 }
 
-if (-not (Test-Path $Root)) {
-    Write-Error "Root path '$Root' does not exist."
+# ============================================================
+#  Resolve search roots
+#  - If -Root was given, use that single path
+#  - Otherwise, detect all mounted filesystem drives
+# ============================================================
+$searchRoots = @()
+
+if ($Root -ne "") {
+    # User specified a specific root
+    if (-not (Test-Path $Root)) {
+        Write-Error "Root path '$Root' does not exist."
+        exit 1
+    }
+    $searchRoots = @($Root)
+} else {
+    # Auto-detect all mounted filesystem drives
+    $searchRoots = Get-PSDrive -PSProvider FileSystem |
+        Where-Object { $_.Root -ne "" -and (Test-Path $_.Root) } |
+        Select-Object -ExpandProperty Root
+}
+
+if ($searchRoots.Count -eq 0) {
+    Write-Error "No valid drives or paths found to search."
     exit 1
 }
 
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
+# ── Normalize search pattern ────────────────────────────────
+# If no wildcard characters are present, wrap in *…* for substring search
+$searchPattern = $Name
+if ($Name -notmatch '\*|\?|\[') { $searchPattern = "*$Name*" }
 
-Write-Host ""
-Write-Host "  🔍  Searching for: " -NoNewline
-Write-Host "$Name" -ForegroundColor Cyan
-Write-Host ""
+# ── Shared state ────────────────────────────────────────────
+$resultBag   = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+$stopFlag    = [System.Collections.Concurrent.ConcurrentDictionary[string,byte]]::new()
+$progressBag = [System.Collections.Concurrent.ConcurrentDictionary[string,string]]::new()
 
-# ── Collect top-level directories ──────────────────────────
-$topDirs = @()
-try {
-    $topDirs = [System.IO.Directory]::GetDirectories($Root)
-} catch {
-    Write-Warning "Could not enumerate '$Root': $_"
-}
-
-$totalDirs  = $topDirs.Count
-$scannedDir = [System.Collections.Concurrent.ConcurrentDictionary[string,byte]]::new()
-$resultBag  = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
-$stopFlag   = [System.Collections.Concurrent.ConcurrentDictionary[string,byte]]::new()
-
-# ── Runspace pool ───────────────────────────────────────────
-$MaxThreads = 8
+# ── Runspace pool — one worker per drive ────────────────────
+$MaxThreads = [math]::Max($searchRoots.Count, 4)
 $pool = [RunspaceFactory]::CreateRunspacePool(1, $MaxThreads)
 $pool.Open()
 
-# ── Worker script block ─────────────────────────────────────
+# ── Worker: scans one entire drive/root recursively ─────────
 $workerScript = {
     param(
         [string]$SearchRoot,
@@ -241,65 +248,75 @@ $workerScript = {
         [bool]$First,
         [System.Collections.Concurrent.ConcurrentBag[string]]$Bag,
         [System.Collections.Concurrent.ConcurrentDictionary[string,byte]]$StopFlag,
-        [System.Collections.Concurrent.ConcurrentDictionary[string,byte]]$ScannedDir
+        [System.Collections.Concurrent.ConcurrentDictionary[string,string]]$ProgressBag
     )
 
-    function Matches-Pattern {
+    function Test-Match {
         param([string]$input, [string]$pattern, [bool]$cs)
         if ($cs) { return $input -clike $pattern }
         else      { return $input -like  $pattern }
     }
 
+    # Iterative DFS — avoids stack overflow on deep trees
     $stack = [System.Collections.Generic.Stack[string]]::new()
     $stack.Push($SearchRoot)
 
     while ($stack.Count -gt 0) {
+        # Honour -First stop signal from any thread
         if ($First -and $StopFlag.Count -gt 0) { break }
 
         $current = $stack.Pop()
-        [void]$ScannedDir.TryAdd($current, 0)
 
+        # Update live progress for this drive
+        [void]$ProgressBag.AddOrUpdate($SearchRoot, $current, { $current })
+
+        # ── Check files in current directory ───────────────
         if (-not $FoldersOnly) {
             try {
+                # EnumerateFiles streams lazily — no full directory load into memory
                 foreach ($f in [System.IO.Directory]::EnumerateFiles($current)) {
                     if ($First -and $StopFlag.Count -gt 0) { break }
                     $leaf = [System.IO.Path]::GetFileName($f)
-                    if (Matches-Pattern $leaf $Pattern $CaseSensitive) {
+                    if (Test-Match $leaf $Pattern $CaseSensitive) {
                         $Bag.Add($f)
                         if ($First) { [void]$StopFlag.TryAdd("stop", 0); break }
                     }
                 }
-            } catch {}
+            } catch {
+                # Access denied or protected folder — skip silently
+            }
         }
 
+        # ── Recurse into subdirectories ─────────────────────
         try {
             foreach ($d in [System.IO.Directory]::EnumerateDirectories($current)) {
                 if ($First -and $StopFlag.Count -gt 0) { break }
+
+                # Check if the folder name itself is a match
                 if (-not $FilesOnly) {
                     $leaf = [System.IO.Path]::GetFileName($d)
-                    if (Matches-Pattern $leaf $Pattern $CaseSensitive) {
+                    if (Test-Match $leaf $Pattern $CaseSensitive) {
                         $Bag.Add($d)
                         if ($First) { [void]$StopFlag.TryAdd("stop", 0); break }
                     }
                 }
+
                 $stack.Push($d)
             }
-        } catch {}
+        } catch {
+            # Access denied — skip silently and continue
+        }
     }
 }
 
-# ── Wildcard wrap ───────────────────────────────────────────
-$searchPattern = $Name
-if ($Name -notmatch '\*|\?|\[') { $searchPattern = "*$Name*" }
-
-# ── Dispatch jobs ───────────────────────────────────────────
+# ── Dispatch one job per drive ──────────────────────────────
 $jobs = [System.Collections.Generic.List[hashtable]]::new()
 
-foreach ($dir in $topDirs) {
+foreach ($root in $searchRoots) {
     $ps = [PowerShell]::Create()
     $ps.RunspacePool = $pool
     [void]$ps.AddScript($workerScript)
-    [void]$ps.AddParameter("SearchRoot",    $dir)
+    [void]$ps.AddParameter("SearchRoot",    $root)
     [void]$ps.AddParameter("Pattern",       $searchPattern)
     [void]$ps.AddParameter("CaseSensitive", $CaseSensitive.IsPresent)
     [void]$ps.AddParameter("FilesOnly",     $FilesOnly.IsPresent)
@@ -307,23 +324,42 @@ foreach ($dir in $topDirs) {
     [void]$ps.AddParameter("First",         $First.IsPresent)
     [void]$ps.AddParameter("Bag",           $resultBag)
     [void]$ps.AddParameter("StopFlag",      $stopFlag)
-    [void]$ps.AddParameter("ScannedDir",    $scannedDir)
-    $jobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke() })
+    [void]$ps.AddParameter("ProgressBag",   $progressBag)
+    $jobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Drive = $root })
 }
 
-# ── Live progress display ───────────────────────────────────
-$spinner = '⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'
-$i = 0
-while ($jobs | Where-Object { -not $_.Handle.IsCompleted }) {
-    $scanned  = $scannedDir.Count
-    $pct      = if ($totalDirs -gt 0) { [math]::Min(99, [int](($scanned / $totalDirs) * 100)) } else { 0 }
-    $lastDir  = if ($scanned -gt 0) { ($scannedDir.Keys | Select-Object -Last 1) } else { $Root }
-    $shortDir = if ($lastDir.Length -gt 52) { "..." + $lastDir.Substring($lastDir.Length - 49) } else { $lastDir }
-    $found    = $resultBag.Count
+# ── Start timer and display ─────────────────────────────────
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-    Write-Host "`r  $($spinner[$i % $spinner.Count])  [$("{0,3}" -f $pct)%]  Scanning: $shortDir   ($found found)     " -NoNewline
+Write-Host ""
+Write-Host "  🔍  Searching for: " -NoNewline
+Write-Host $Name -ForegroundColor Cyan
+
+$driveList = $searchRoots -join "  "
+Write-Host "  💾  Drives      : $driveList"
+Write-Host ""
+
+# ── Live progress loop ──────────────────────────────────────
+$spinner   = '⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'
+$tick      = 0
+$doneCount = 0
+$total     = $jobs.Count
+
+while ($jobs | Where-Object { -not $_.Handle.IsCompleted }) {
+    $doneCount = ($jobs | Where-Object { $_.Handle.IsCompleted }).Count
+    $pct       = if ($total -gt 0) { [math]::Min(99, [int](($doneCount / $total) * 100)) } else { 0 }
+    $found     = $resultBag.Count
+
+    # Show the most recently scanned path across all active workers
+    $activePath = ""
+    foreach ($kv in $progressBag.GetEnumerator()) {
+        if ($kv.Value -ne "") { $activePath = $kv.Value; break }
+    }
+    $short = if ($activePath.Length -gt 55) { "..." + $activePath.Substring($activePath.Length - 52) } else { $activePath }
+
+    Write-Host "`r  $($spinner[$tick % $spinner.Count])  [$("{0,3}" -f $pct)%]  $short   ($found found)     " -NoNewline
     Start-Sleep -Milliseconds 100
-    $i++
+    $tick++
 }
 
 Write-Host "`r  ✅  Scan complete.                                                              "
@@ -343,10 +379,11 @@ $results = $resultBag.ToArray() | Sort-Object
 Write-Host ""
 
 if ($results.Count -eq 0) {
-    Write-Host "  ⚠️  No matches found for '$Name' under $Root" -ForegroundColor Yellow
+    $scope = if ($Root -ne "") { "under $Root" } else { "across all drives" }
+    Write-Host "  ⚠️  No matches found for '$Name' $scope" -ForegroundColor Yellow
 } else {
     $label = if ($First -and $results.Count -eq 1) { "first match" } else { "match$(if($results.Count -ne 1){'es'})" }
-    Write-Host "  📋  Results  ($($results.Count) $label):" -ForegroundColor Green
+    Write-Host "  📋  Found ($($results.Count) $label):" -ForegroundColor Green
     Write-Host "  $('─' * 65)"
 
     $counter = 1
@@ -356,7 +393,7 @@ if ($results.Count -eq 0) {
         $leaf  = [System.IO.Path]::GetFileName($r)
         $dir   = [System.IO.Path]::GetDirectoryName($r)
         Write-Host "  $icon  $counter`: " -NoNewline
-        Write-Host "$leaf" -ForegroundColor Cyan -NoNewline
+        Write-Host $leaf -ForegroundColor Cyan -NoNewline
         Write-Host "   path: $dir"
         $counter++
     }
